@@ -1,0 +1,11 @@
+.env
+wb_monitor.db
+
+*.db
+__pycache__/
+
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
