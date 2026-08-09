@@ -1,70 +1,102 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from typing import List, Optional
 
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    builder = ReplyKeyboardBuilder()
-    builder.row(
-        KeyboardButton(text="➕ Добавить товар"),
-        KeyboardButton(text="📋 Мои товары"),
-    )
-    builder.row(
-        KeyboardButton(text="📊 Скачать Excel"),
-        KeyboardButton(text="📈 История цены"),
-    )
-    builder.row(
-        KeyboardButton(text="⚙️ Настройки"),
-        KeyboardButton(text="🔔 Уведомления"),
-    )
-    builder.row(
-        KeyboardButton(text="ℹ️ Помощь"),
-    )
-    return builder.as_markup(resize_keyboard=True)
+# Сколько товаров на одной странице
+PRODUCTS_PER_PAGE = 6
 
 
-def cancel_kb() -> ReplyKeyboardMarkup:
-    builder = ReplyKeyboardBuilder()
-    builder.add(KeyboardButton(text="❌ Отмена"))
-    return builder.as_markup(resize_keyboard=True)
+def main_menu_kb() -> InlineKeyboardMarkup:
+    """Главное меню — только нужные кнопки"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="➕ Добавить товар", callback_data="menu:add"),
+        InlineKeyboardButton(text="📋 Мои товары", callback_data="menu:my_products"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📊 Excel-отчёт", callback_data="menu:excel"),
+        InlineKeyboardButton(text="🔔 Уведомления", callback_data="menu:notifications"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="ℹ️ Помощь", callback_data="menu:help"),
+    )
+    return builder.as_markup()
+
+
+def cancel_inline_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main"))
+    return builder.as_markup()
+
+
+def products_list_kb(
+    products: list,
+    page: int = 0,
+    total: int = 0,
+) -> InlineKeyboardMarkup:
+    """
+    Список товаров кнопками + пагинация.
+    products — список UserProduct с уже загруженным .product
+    """
+    builder = InlineKeyboardBuilder()
+
+    for up in products:
+        p = up.product
+        name = (p.name or f"Артикул {p.nm_id}")[:40]
+        price = f"{p.current_price:.0f}₽" if p.current_price else "—"
+        prefix = "⏸" if up.is_paused else "🟢"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{prefix} {name} | {price}",
+                callback_data=f"product:{p.id}",
+            )
+        )
+
+    # Пагинация
+    total_pages = max(1, (total + PRODUCTS_PER_PAGE - 1) // PRODUCTS_PER_PAGE)
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(
+            InlineKeyboardButton(text="⬅️", callback_data=f"products_page:{page - 1}")
+        )
+    nav_buttons.append(
+        InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop")
+    )
+    if page < total_pages - 1:
+        nav_buttons.append(
+            InlineKeyboardButton(text="➡️", callback_data=f"products_page:{page + 1}")
+        )
+    if nav_buttons:
+        builder.row(*nav_buttons)
+
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
+    return builder.as_markup()
 
 
 def product_actions_kb(product_id: int, is_paused: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(
-            text="🔄 Обновить сейчас",
-            callback_data=f"update_product:{product_id}"
-        )
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"update_product:{product_id}")
     )
     if is_paused:
         builder.row(
-            InlineKeyboardButton(
-                text="▶️ Возобновить мониторинг",
-                callback_data=f"resume_product:{product_id}"
-            )
+            InlineKeyboardButton(text="▶️ Возобновить", callback_data=f"resume_product:{product_id}")
         )
     else:
         builder.row(
-            InlineKeyboardButton(
-                text="⏸ Пауза мониторинга",
-                callback_data=f"pause_product:{product_id}"
-            )
+            InlineKeyboardButton(text="⏸ Пауза", callback_data=f"pause_product:{product_id}")
         )
     builder.row(
-        InlineKeyboardButton(
-            text="📈 История цены",
-            callback_data=f"history:{product_id}"
-        ),
-        InlineKeyboardButton(
-            text="⚙️ Уведомления",
-            callback_data=f"notify_settings:{product_id}"
-        ),
+        InlineKeyboardButton(text="📈 История цен", callback_data=f"history:{product_id}"),
+        InlineKeyboardButton(text="🔔 Уведомления", callback_data=f"notify_settings:{product_id}"),
     )
     builder.row(
-        InlineKeyboardButton(
-            text="🗑 Удалить",
-            callback_data=f"delete_product:{product_id}"
-        )
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_product:{product_id}")
+    )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ К списку", callback_data="menu:my_products"),
+        InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main"),
     )
     return builder.as_markup()
 
@@ -73,12 +105,27 @@ def confirm_delete_kb(product_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete:{product_id}"),
-        InlineKeyboardButton(text="❌ Нет", callback_data="cancel_delete"),
+        InlineKeyboardButton(text="❌ Нет", callback_data=f"product:{product_id}"),
     )
     return builder.as_markup()
 
 
 def back_to_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu"))
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
+    return builder.as_markup()
+
+
+def notifications_global_kb(enabled: bool = True) -> InlineKeyboardMarkup:
+    """Глобальные уведомления вкл/выкл"""
+    builder = InlineKeyboardBuilder()
+    if enabled:
+        builder.row(
+            InlineKeyboardButton(text="🔕 Выключить все уведомления", callback_data="notify_global:off")
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(text="🔔 Включить все уведомления", callback_data="notify_global:on")
+        )
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return builder.as_markup()

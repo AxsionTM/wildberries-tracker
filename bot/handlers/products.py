@@ -2,7 +2,6 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.parser import extract_nm_id, parse_and_get_info
 from bot.services.db_service import (
@@ -13,7 +12,15 @@ from bot.services.db_service import (
     get_user_products,
     get_user_product,
 )
-from bot.keyboards.inline import main_menu_kb, cancel_kb, product_actions_kb, confirm_delete_kb
+from bot.keyboards.inline import (
+    main_menu_kb,
+    cancel_inline_kb,
+    product_actions_kb,
+    confirm_delete_kb,
+    products_list_kb,
+    PRODUCTS_PER_PAGE,
+    back_to_menu_kb,
+)
 from bot.database.session import async_session
 from bot.config import settings
 
@@ -25,7 +32,6 @@ class AddProductStates(StatesGroup):
 
 
 def format_product_card(product, user_product=None) -> str:
-    """Красивая карточка товара (как в рабочем мини-боте)"""
     status = ""
     if user_product:
         if user_product.is_paused:
@@ -82,31 +88,45 @@ def format_product_card(product, user_product=None) -> str:
     return text
 
 
-@router.message(F.text == "➕ Добавить товар")
-async def add_product_start(message: Message, state: FSMContext):
+async def _edit(callback: CallbackQuery, text: str, reply_markup=None):
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        await callback.message.answer(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+# ===================== ГЛАВНОЕ МЕНЮ: ДОБАВИТЬ =====================
+
+@router.callback_query(F.data == "menu:add")
+async def cb_add_product(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddProductStates.waiting_for_input)
-    await message.answer(
-        "Отправь <b>артикул</b> товара Wildberries или <b>ссылку</b> на него.\n\n"
-        "Можно отправить несколько артикулов/ссылок списком — каждый с новой строки.\n\n"
+    text = (
+        "➕ <b>Добавить товар</b>\n\n"
+        "Пришли <b>артикул</b> или <b>ссылку</b> на товар Wildberries.\n\n"
+        "Можно несколько — каждый с новой строки.\n\n"
         "Пример:\n"
-        "<code>123456789</code>\n"
-        "<code>https://www.wildberries.ru/catalog/987654321/detail.aspx</code>",
-        parse_mode="HTML",
-        reply_markup=cancel_kb(),
+        "<code>816758849</code>\n"
+        "<code>https://www.wildberries.ru/catalog/816758849/detail.aspx</code>"
     )
-
-
-@router.message(F.text == "❌ Отмена")
-async def cancel_handler(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Отменено.", reply_markup=main_menu_kb())
+    await _edit(callback, text, cancel_inline_kb())
 
 
 @router.message(AddProductStates.waiting_for_input)
 async def process_add_product(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
     if not text:
-        await message.answer("Пустое сообщение. Пришли артикул или ссылку.")
+        await message.answer("Пришли артикул или ссылку.", reply_markup=cancel_inline_kb())
         return
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -118,14 +138,12 @@ async def process_add_product(message: Message, state: FSMContext):
 
     if not nm_ids:
         await message.answer(
-            "Не удалось найти артикул.\n"
-            "Пришли число (артикул) или ссылку вида:\n"
-            "<code>https://www.wildberries.ru/catalog/12345678/detail.aspx</code>",
+            "Не удалось найти артикул.\nПришли число или ссылку WB.",
+            reply_markup=cancel_inline_kb(),
             parse_mode="HTML",
         )
         return
 
-    # Убираем дубли
     nm_ids = list(dict.fromkeys(nm_ids))
 
     async with async_session() as session:
@@ -135,101 +153,114 @@ async def process_add_product(message: Message, state: FSMContext):
             username=message.from_user.username,
             full_name=message.from_user.full_name,
         )
-
         current_count = await get_user_products_count(session, user.id)
-        available_slots = user.max_products - current_count
+        available = user.max_products - current_count
 
-        if available_slots <= 0:
+        if available <= 0:
             await message.answer(
-                f"❌ Достигнут лимит товаров ({user.max_products}).\n"
-                "Удали ненужные товары или обратись к администратору.",
+                f"❌ Лимит товаров ({user.max_products}). Удали ненужные.",
                 reply_markup=main_menu_kb(),
             )
             await state.clear()
             return
 
-        if len(nm_ids) > available_slots:
-            nm_ids = nm_ids[:available_slots]
-            await message.answer(
-                f"⚠️ Можно добавить только {available_slots} товар(ов) (лимит {user.max_products}). "
-                f"Добавляю первые {available_slots}."
-            )
+        if len(nm_ids) > available:
+            nm_ids = nm_ids[:available]
+            await message.answer(f"⚠️ Добавлю только {available} (лимит).")
 
-        await message.answer(f"⏳ Обрабатываю {len(nm_ids)} товар(ов)...")
+        status_msg = await message.answer(f"⏳ Обрабатываю {len(nm_ids)} товар(ов)...")
 
-        added = 0
-        already = 0
-        failed = 0
+        added = already = failed = 0
+        last_product = last_up = None
 
         for nm_id in nm_ids:
             data = await parse_and_get_info(nm_id)
             if not data:
                 failed += 1
-                await message.answer(f"❌ Не удалось получить данные по артикулу <code>{nm_id}</code>", parse_mode="HTML")
                 continue
 
             product = await get_or_create_product(session, data)
             user_product, created = await add_product_to_user(session, user, product)
+            last_product, last_up = product, user_product
 
             if created:
                 added += 1
-                card = format_product_card(product, user_product)
-                await message.answer(
-                    f"✅ Товар добавлен!\n\n{card}",
-                    parse_mode="HTML",
-                    reply_markup=product_actions_kb(product.id),
-                    disable_web_page_preview=True,
-                )
             else:
                 already += 1
-                card = format_product_card(product, user_product)
-                await message.answer(
-                    f"ℹ️ Товар уже был в вашем списке (мониторинг возобновлён).\n\n{card}",
-                    parse_mode="HTML",
-                    reply_markup=product_actions_kb(product.id, is_paused=user_product.is_paused),
-                    disable_web_page_preview=True,
-                )
 
-        summary = f"\n📊 Итого: добавлено {added}, уже было {already}, ошибок {failed}"
-        await message.answer(summary, reply_markup=main_menu_kb())
         await state.clear()
 
+        summary = f"✅ Готово: добавлено {added}, уже было {already}, ошибок {failed}"
 
-@router.message(F.text == "📋 Мои товары")
-async def my_products(message: Message):
+        if last_product and (added + already) == 1:
+            card = format_product_card(last_product, last_up)
+            await status_msg.edit_text(
+                f"{summary}\n\n{card}",
+                parse_mode="HTML",
+                reply_markup=product_actions_kb(last_product.id, is_paused=last_up.is_paused),
+                disable_web_page_preview=True,
+            )
+        else:
+            await status_msg.edit_text(summary, reply_markup=main_menu_kb())
+
+
+# ===================== МОИ ТОВАРЫ (список + пагинация) =====================
+
+async def _show_products_page(callback: CallbackQuery, page: int = 0):
     async with async_session() as session:
-        user = await get_or_create_user(
-            session,
-            telegram_id=message.from_user.id,
-            username=message.from_user.username,
-            full_name=message.from_user.full_name,
+        user = await get_or_create_user(session, callback.from_user.id)
+        all_products = await get_user_products(session, user.id)
+        total = len(all_products)
+
+        if total == 0:
+            await _edit(
+                callback,
+                "📋 <b>Мои товары</b>\n\nУ тебя пока нет товаров.\nНажми «➕ Добавить товар».",
+                main_menu_kb(),
+            )
+            return
+
+        start = page * PRODUCTS_PER_PAGE
+        end = start + PRODUCTS_PER_PAGE
+        page_items = all_products[start:end]
+
+        text = (
+            f"📋 <b>Мои товары</b> — {total} шт.\n\n"
+            f"Страница {page + 1} из {max(1, (total + PRODUCTS_PER_PAGE - 1) // PRODUCTS_PER_PAGE)}\n"
+            "Нажми на товар, чтобы открыть карточку 👇"
         )
-        products = await get_user_products(session, user.id)
+        await _edit(callback, text, products_list_kb(page_items, page=page, total=total))
 
-    if not products:
-        await message.answer(
-            "У тебя пока нет товаров.\nНажми «➕ Добавить товар», чтобы начать.",
-            reply_markup=main_menu_kb(),
-        )
-        return
 
-    await message.answer(f"📋 Твои товары ({len(products)}):")
+@router.callback_query(F.data == "menu:my_products")
+async def cb_my_products(callback: CallbackQuery):
+    await _show_products_page(callback, page=0)
 
-    for up in products:
-        product = up.product
-        card = format_product_card(product, up)
-        await message.answer(
-            card,
-            parse_mode="HTML",
-            reply_markup=product_actions_kb(product.id, is_paused=up.is_paused),
-            disable_web_page_preview=True,
-        )
 
+@router.callback_query(F.data.startswith("products_page:"))
+async def cb_products_page(callback: CallbackQuery):
+    page = int(callback.data.split(":")[1])
+    await _show_products_page(callback, page=page)
+
+
+@router.callback_query(F.data.startswith("product:"))
+async def cb_open_product(callback: CallbackQuery):
+    product_id = int(callback.data.split(":")[1])
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        up = await get_user_product(session, user.id, product_id)
+        if not up:
+            await callback.answer("Товар не найден", show_alert=True)
+            return
+        card = format_product_card(up.product, up)
+        await _edit(callback, card, product_actions_kb(product_id, is_paused=up.is_paused))
+
+
+# ===================== ДЕЙСТВИЯ С ТОВАРОМ =====================
 
 @router.callback_query(F.data.startswith("update_product:"))
-async def update_product_callback(callback: CallbackQuery):
+async def cb_update_product(callback: CallbackQuery):
     product_id = int(callback.data.split(":")[1])
-
     async with async_session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
         up = await get_user_product(session, user.id, product_id)
@@ -240,92 +271,92 @@ async def update_product_callback(callback: CallbackQuery):
         await callback.answer("Обновляю...")
         data = await parse_and_get_info(up.product.nm_id)
         if not data:
-            await callback.message.answer("❌ Не удалось обновить данные. Попробуй позже.")
+            await callback.message.answer("❌ Не удалось обновить. Попробуй позже.")
             return
 
         product = await get_or_create_product(session, data)
         card = format_product_card(product, up)
-        await callback.message.edit_text(
-            f"✅ Данные обновлены!\n\n{card}",
-            parse_mode="HTML",
-            reply_markup=product_actions_kb(product.id, is_paused=up.is_paused),
-            disable_web_page_preview=True,
-        )
+        try:
+            await callback.message.edit_text(
+                f"✅ Обновлено!\n\n{card}",
+                parse_mode="HTML",
+                reply_markup=product_actions_kb(product.id, is_paused=up.is_paused),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("pause_product:"))
-async def pause_product_callback(callback: CallbackQuery):
+async def cb_pause(callback: CallbackQuery):
     product_id = int(callback.data.split(":")[1])
-
     async with async_session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
         up = await get_user_product(session, user.id, product_id)
         if not up:
-            await callback.answer("Товар не найден", show_alert=True)
+            await callback.answer("Не найден", show_alert=True)
             return
-
         up.is_paused = True
         await session.commit()
-        await callback.answer("Мониторинг поставлен на паузу")
         card = format_product_card(up.product, up)
-        await callback.message.edit_text(
-            card,
-            parse_mode="HTML",
-            reply_markup=product_actions_kb(product_id, is_paused=True),
-            disable_web_page_preview=True,
-        )
+        await _edit(callback, card, product_actions_kb(product_id, is_paused=True))
 
 
 @router.callback_query(F.data.startswith("resume_product:"))
-async def resume_product_callback(callback: CallbackQuery):
+async def cb_resume(callback: CallbackQuery):
     product_id = int(callback.data.split(":")[1])
-
     async with async_session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
         up = await get_user_product(session, user.id, product_id)
         if not up:
-            await callback.answer("Товар не найден", show_alert=True)
+            await callback.answer("Не найден", show_alert=True)
             return
-
         up.is_paused = False
         up.is_active = True
         await session.commit()
-        await callback.answer("Мониторинг возобновлён")
         card = format_product_card(up.product, up)
-        await callback.message.edit_text(
-            card,
-            parse_mode="HTML",
-            reply_markup=product_actions_kb(product_id, is_paused=False),
-            disable_web_page_preview=True,
-        )
+        await _edit(callback, card, product_actions_kb(product_id, is_paused=False))
 
 
 @router.callback_query(F.data.startswith("delete_product:"))
-async def delete_product_callback(callback: CallbackQuery):
+async def cb_delete_ask(callback: CallbackQuery):
     product_id = int(callback.data.split(":")[1])
-    await callback.message.edit_reply_markup(reply_markup=confirm_delete_kb(product_id))
-    await callback.answer()
+    await _edit(
+        callback,
+        "🗑 Удалить товар из мониторинга?",
+        confirm_delete_kb(product_id),
+    )
 
 
 @router.callback_query(F.data.startswith("confirm_delete:"))
-async def confirm_delete_callback(callback: CallbackQuery):
+async def cb_delete_confirm(callback: CallbackQuery):
     product_id = int(callback.data.split(":")[1])
-
     async with async_session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
         up = await get_user_product(session, user.id, product_id)
-        if not up:
-            await callback.answer("Товар не найден", show_alert=True)
-            return
-
-        await session.delete(up)
-        await session.commit()
-
-    await callback.message.edit_text("🗑 Товар удалён из мониторинга.")
-    await callback.answer()
+        if up:
+            await session.delete(up)
+            await session.commit()
+    await _edit(callback, "🗑 Товар удалён.", main_menu_kb())
 
 
-@router.callback_query(F.data == "cancel_delete")
-async def cancel_delete_callback(callback: CallbackQuery):
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Отменено")
+# Заглушки для истории и уведомлений по товару (следующий этап)
+@router.callback_query(F.data.startswith("history:"))
+async def cb_history_stub(callback: CallbackQuery):
+    await callback.answer("История цен — в следующем обновлении", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("notify_settings:"))
+async def cb_notify_stub(callback: CallbackQuery):
+    await callback.answer("Настройки уведомлений — в следующем обновлении", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("notify_global:"))
+async def cb_notify_global(callback: CallbackQuery):
+    mode = callback.data.split(":")[1]
+    if mode == "off":
+        text = "🔕 Уведомления по всем товарам <b>выключены</b> (заглушка, логика в следующем этапе)."
+    else:
+        text = "🔔 Уведомления по всем товарам <b>включены</b> (заглушка, логика в следующем этапе)."
+    from bot.keyboards.inline import notifications_global_kb
+    await _edit(callback, text, notifications_global_kb(enabled=(mode == "on")))
