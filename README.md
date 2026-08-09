@@ -165,7 +165,9 @@ python run.py
 Код опубликован в ознакомительных целях (портфолио). Копирование, модификация и
 коммерческое использование без согласия автора запрещены. Все права защищены.
 
-                                  Made with ❤️ by Axsion
+<p align="center">
+  Made with ❤️ by <a href="https://github.com/AxsionTM">Axsion</a>
+</p>
 
 <p align="center">
   <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&height=100&section=footer" />
