@@ -9,7 +9,7 @@
 ---
 
 <p align="center">
-<img src="https://avatars.githubusercontent.com/u/146373364?v=4" width="120" style="border-radius:50%">
+  <img src="https://wsrv.nl/?url=avatars.githubusercontent.com/u/146373364%3Fv%3D4&w=200&h=200&fit=cover&mask=circle" width="120">
 </p>
 <h2 align="center">👨‍💻 Maxsim (Axsion)</h2>
 <p align="center">
