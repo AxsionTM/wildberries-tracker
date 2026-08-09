@@ -1,4 +1,4 @@
-from aiogram import Router, F
+from aiogram import Router, F, Bot
 from aiogram.types import Message
 from aiogram.filters import CommandStart, Command
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.services.db_service import get_or_create_user
 from bot.keyboards.inline import main_menu_kb
 from bot.database.session import async_session
+from bot.config import settings
+from bot.services.monitor import run_monitoring_cycle
 
 router = Router(name="start")
 
@@ -53,3 +55,18 @@ async def cmd_help(message: Message):
         "По вопросам и предложениям — пиши администратору."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+@router.message(Command("force_update"))
+async def cmd_force_update(message: Message, bot: Bot):
+    """Админ-команда: принудительно запустить цикл мониторинга прямо сейчас"""
+    if message.from_user.id not in settings.admin_ids_list:
+        await message.answer("⛔ Команда только для администратора.")
+        return
+
+    await message.answer("🔄 Запускаю принудительное обновление всех товаров...")
+    try:
+        await run_monitoring_cycle(bot)
+        await message.answer("✅ Цикл мониторинга завершён. Смотри логи и уведомления.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при обновлении: {e}")

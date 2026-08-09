@@ -25,44 +25,60 @@ class AddProductStates(StatesGroup):
 
 
 def format_product_card(product, user_product=None) -> str:
-    """Красивая карточка товара"""
-    price = product.current_price
-    old_price = product.price_without_discount
-    discount = product.discount_percent
-
-    price_line = f"💰 <b>{price} ₽</b>" if price else "💰 цена неизвестна"
-    if old_price and discount:
-        price_line += f"  <s>{old_price} ₽</s>  (−{discount}%)"
-
-    stock_line = f"📦 Остаток: {product.stock} шт." if product.stock is not None else "📦 Остаток: н/д"
-    rating_line = f"⭐ {product.rating}" if product.rating else "⭐ н/д"
-    feedbacks = product.feedbacks_count or 0
-    questions = product.questions_count or 0
-
+    """Красивая карточка товара (как в рабочем мини-боте)"""
     status = ""
     if user_product:
         if user_product.is_paused:
-            status = "⏸ <i>мониторинг на паузе</i>\n"
+            status = "⏸ <i>мониторинг на паузе</i>\n\n"
         elif not user_product.is_active:
-            status = "❌ <i>удалён из мониторинга</i>\n"
+            status = "❌ <i>удалён из мониторинга</i>\n\n"
+
+    name = product.name or "Без названия"
+    brand = product.brand or "—"
+    seller = product.seller or "—"
 
     text = (
         f"{status}"
-        f"<b>{product.name or 'Без названия'}</b>\n"
-        f"🏷 Бренд: {product.brand or '—'}\n"
-        f"🆔 Артикул: <code>{product.nm_id}</code>\n"
-        f"👤 Продавец: {product.seller or '—'}\n\n"
-        f"{price_line}\n"
-        f"{stock_line}\n"
-        f"{rating_line}  |  💬 {feedbacks} отзывов  |  ❓ {questions} вопросов\n"
+        "🛍 <b>ТОВАР WILDBERRIES</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"📦 <b>Артикул:</b> <code>{product.nm_id}</code>\n"
+        f"📝 <b>Название:</b> {name}\n"
+        f"🏷 <b>Бренд:</b> {brand}\n\n"
+        "💰 <b>ЦЕНА</b>\n"
     )
-    if product.is_in_promo:
-        text += "🔥 <b>В акции!</b>\n"
-    if product.last_updated:
-        text += f"\n🕐 Обновлено: {product.last_updated.strftime('%d.%m.%Y %H:%M')} UTC"
-    if product.url:
-        text += f"\n🔗 <a href=\"{product.url}\">Открыть на WB</a>"
 
+    if product.current_price is not None:
+        price_str = f"{product.current_price:,.0f}".replace(",", " ")
+        text += f"🟢 Сейчас: <b>{price_str} ₽</b>\n"
+    else:
+        text += "🟢 Сейчас: —\n"
+
+    if product.price_without_discount is not None:
+        old_str = f"{product.price_without_discount:,.0f}".replace(",", " ")
+        text += f"⚪ Без скидки: {old_str} ₽\n"
+
+    if product.discount_percent is not None:
+        text += f"🔥 Скидка: <b>{product.discount_percent:.0f}%</b>\n"
+
+    text += "\n⭐ <b>ОЦЕНКИ</b>\n"
+    if product.rating is not None:
+        text += f"⭐ Рейтинг: <b>{product.rating}</b>\n"
+    if product.feedbacks_count is not None:
+        text += f"💬 Отзывов: <b>{product.feedbacks_count}</b>\n"
+
+    text += f"\n🏪 <b>ПРОДАВЕЦ</b>\n👤 {seller}\n"
+
+    if product.stock is not None:
+        text += f"\n📦 Остаток: <b>{product.stock} шт.</b>\n"
+
+    if product.is_in_promo:
+        text += "\n🔥 <b>В акции!</b>\n"
+
+    text += (
+        "\n━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 <a href=\"https://www.wildberries.ru/catalog/{product.nm_id}/detail.aspx\">"
+        "Открыть товар на Wildberries</a>"
+    )
     return text
 
 
