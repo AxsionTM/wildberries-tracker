@@ -1,4 +1,4 @@
-aiogram==3.13.1
+﻿aiogram==3.13.1
 sqlalchemy[asyncio]==2.0.36
 aiosqlite==0.20.0
 httpx==0.27.2
@@ -13,3 +13,7 @@ aiosmtplib==3.0.2
 alembic==1.14.0
 greenlet==3.1.1
 uvloop==0.21.0; sys_platform != "win32"
+
+# Telegram Mini App: backend REST API + сервер статики
+fastapi==0.115.6
+uvicorn[standard]==0.32.1

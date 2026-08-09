@@ -3,11 +3,11 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 
-from bot.services.db_service import get_or_create_user
+from bot.services.db_service import get_or_create_user, get_product_by_nm_id
 from bot.keyboards.inline import main_menu_kb, back_to_menu_kb, notifications_global_kb
 from bot.database.session import async_session
 from bot.config import settings
-from bot.services.monitor import run_monitoring_cycle
+from bot.services.monitor import run_monitoring_cycle, process_product
 
 router = Router(name="start")
 
@@ -69,28 +69,27 @@ async def cb_help(callback: CallbackQuery):
 
 @router.callback_query(F.data == "menu:notifications")
 async def cb_notifications(callback: CallbackQuery):
-    # Пока упрощённо: глобальный вкл/выкл (детали в следующем этапе)
+    async with async_session() as session:
+        user = await get_or_create_user(
+            session=session,
+            telegram_id=callback.from_user.id,
+            username=callback.from_user.username,
+            full_name=callback.from_user.full_name,
+        )
+        enabled = user.notifications_enabled
+
     text = (
         "🔔 <b>Уведомления</b>\n\n"
         "Здесь можно включить или выключить уведомления "
         "сразу по <b>всем</b> твоим товарам.\n\n"
-        "Подробные настройки (падение цены, остаток и т.д.) "
-        "доступны внутри карточки каждого товара."
+        f"Сейчас уведомления {'включены 🔔' if enabled else 'выключены 🔕'}.\n\n"
+        "Уведомления по отдельному товару можно дополнительно "
+        "включить/выключить внутри карточки этого товара."
     )
-    await _edit_or_answer(callback, text, notifications_global_kb(enabled=True))
+    await _edit_or_answer(callback, text, notifications_global_kb(enabled=enabled))
 
 
-@router.callback_query(F.data == "menu:excel")
-async def cb_excel_stub(callback: CallbackQuery):
-    text = (
-        "📊 <b>Excel-отчёт</b>\n\n"
-        "Этот раздел будет доработан в следующем этапе:\n"
-        "• выбор товаров\n"
-        "• выбор полей (цена, бренд, рейтинг...)\n"
-        "• скачивание файла\n\n"
-        "Пока можно пользоваться карточкой товара."
-    )
-    await _edit_or_answer(callback, text, back_to_menu_kb())
+# Реальный обработчик Excel-отчёта находится в bot/handlers/excel.py (router excel_router)
 
 
 @router.callback_query(F.data == "noop")
@@ -109,3 +108,67 @@ async def cmd_force_update(message: Message, bot: Bot):
         await message.answer("✅ Готово.")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
+
+
+@router.message(Command("simulate_price"))
+async def cmd_simulate_price(message: Message, bot: Bot):
+    """
+    Тестовая команда для проверки уведомлений без ожидания реального
+    изменения цены на Wildberries.
+
+    Использование:
+    /simulate_price <артикул> <новая_цена> [старая_цена_без_скидки]
+
+    Пример:
+    /simulate_price 816758849 1500
+    """
+    if message.from_user.id not in settings.admin_ids_list:
+        await message.answer("⛔ Только для администратора.")
+        return
+
+    parts = (message.text or "").split()[1:]
+    if len(parts) < 2:
+        await message.answer(
+            "Использование:\n"
+            "<code>/simulate_price артикул новая_цена [цена_без_скидки]</code>\n\n"
+            "Пример:\n<code>/simulate_price 816758849 1500</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        nm_id = int(parts[0])
+        new_price = float(parts[1])
+        new_price_without_discount = float(parts[2]) if len(parts) > 2 else None
+    except ValueError:
+        await message.answer("Артикул и цена должны быть числами.")
+        return
+
+    async with async_session() as session:
+        product = await get_product_by_nm_id(session, nm_id)
+        if not product:
+            await message.answer(
+                f"❌ Товар с артикулом <code>{nm_id}</code> не найден в базе.\n"
+                "Он должен быть сначала добавлен через «➕ Добавить товар» "
+                "(хотя бы одним пользователем).",
+                parse_mode="HTML",
+            )
+            return
+
+        override = {"current_price": new_price}
+        if new_price_without_discount is not None:
+            override["price_without_discount"] = new_price_without_discount
+
+        old_price = product.current_price
+        sent = await process_product(session, product, bot, override_data=override)
+
+    await message.answer(
+        f"✅ Готово.\n\n"
+        f"Товар: <code>{nm_id}</code>\n"
+        f"Цена: {old_price} ₽ → <b>{new_price} ₽</b>\n"
+        f"Уведомлений отправлено: <b>{sent}</b>\n\n"
+        f"Если 0 — проверь: включены ли уведомления у подписчиков товара "
+        f"(глобально и по товару), не на паузе ли мониторинг, и достаточно ли "
+        f"сильно изменилась цена (порог по умолчанию — любое изменение от 1 ₽).",
+        parse_mode="HTML",
+    )

@@ -3,6 +3,7 @@
 Запускается по расписанию через APScheduler.
 """
 
+import asyncio
 import logging
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
@@ -234,10 +235,16 @@ async def process_product(
     session: AsyncSession,
     product: Product,
     bot: Bot,
+    override_data: Optional[Dict[str, Any]] = None,
 ) -> int:
     """
     Обновляет один товар и рассылает уведомления подписанным пользователям.
     Возвращает количество отправленных уведомлений.
+
+    override_data — если передан, парсер НЕ вызывается, а новые данные берутся
+    отсюда (старые поля дозаполняются текущими значениями товара).
+    Используется командой /simulate_price для тестирования уведомлений без
+    ожидания реального изменения цены на Wildberries.
     """
     # Сохраняем старые данные до обновления
     old_data = {
@@ -252,11 +259,15 @@ async def process_product(
         "is_available": product.is_available,
     }
 
-    # Парсим свежие данные
-    new_data = await parse_and_get_info(product.nm_id)
-    if not new_data:
-        logger.warning(f"Не удалось обновить товар nm_id={product.nm_id}")
-        return 0
+    if override_data is not None:
+        # Тестовый режим: берём старые данные товара и подменяем нужные поля вручную
+        new_data = {**old_data, "nm_id": product.nm_id, **override_data}
+    else:
+        # Обычный режим: парсим свежие данные с Wildberries
+        new_data = await parse_and_get_info(product.nm_id)
+        if not new_data:
+            logger.warning(f"Не удалось обновить товар nm_id={product.nm_id}")
+            return 0
 
     # Обновляем товар + пишем историю
     updated_product = await get_or_create_product(session, new_data)
@@ -279,6 +290,11 @@ async def process_product(
     sent_count = 0
 
     for up in user_products:
+        # Глобальный переключатель (главное меню) и переключатель по конкретному товару (карточка).
+        # Если хотя бы один выключен — уведомления по этому товару этому пользователю не шлём.
+        if not up.user.notifications_enabled or not up.notifications_enabled:
+            continue
+
         notifications = build_notification_messages(up, old_data, new_data)
 
         for notif_type, text in notifications:
@@ -312,16 +328,61 @@ async def process_product(
     return sent_count
 
 
+async def _process_one_product_safe(
+    nm_id: int,
+    bot: Bot,
+    semaphore: asyncio.Semaphore,
+) -> int:
+    """
+    Обновляет один товар в СВОЕЙ собственной сессии БД, под семафором,
+    ограничивающим число одновременных запросов к WB (settings.MAX_CONCURRENT_PARSES).
+
+    Отдельная сессия на товар (а не одна общая на весь цикл) нужна потому,
+    что AsyncSession не потокобезопасна/не рассчитана на параллельное
+    использование из нескольких корутин одновременно.
+
+    Ошибка при обработке одного товара (сеть, парсинг, БД) ловится здесь же
+    и не прерывает обработку остальных товаров (см. сценарий "несколько
+    товаров, обработка одного не блокирует остальные").
+    """
+    async with semaphore:
+        try:
+            async with async_session() as session:
+                result = await session.execute(
+                    select(Product).where(Product.nm_id == nm_id)
+                )
+                product = result.scalar_one_or_none()
+                if product is None:
+                    return 0
+                return await process_product(session, product, bot)
+        except Exception as e:
+            logger.error(f"Ошибка при обработке nm_id={nm_id}: {e}")
+            return 0
+
+
 async def run_monitoring_cycle(bot: Bot) -> None:
     """
     Один полный цикл мониторинга всех активных товаров.
+
+    У WB нет push/webhook/WebSocket-механизма для оповещения об изменении цены
+    (это подтверждено анализом используемого источника данных — card.wb.ru отдаёт
+    обычный JSON только в ответ на прямой запрос), поэтому опрос остаётся
+    необходимым polling-механизмом. Чтобы задержка обнаружения изменения цены
+    не росла линейно с числом отслеживаемых товаров, товары опрашиваются
+    ПАРАЛЛЕЛЬНО (с ограничением на число одновременных запросов), а не по очереди
+    друг за другом, как раньше. planировщик (APScheduler, см. main.py) не даёт
+    новому циклу стартовать, пока не завершился предыдущий (max_instances=1),
+    поэтому для одного и того же товара никогда не выполняется два опроса
+    одновременно.
     """
     logger.info("🔄 Запуск цикла мониторинга...")
 
     async with async_session() as session:
-        # Получаем все товары, у которых есть хотя бы один активный подписчик
+        # Получаем nm_id всех товаров, у которых есть хотя бы один активный подписчик.
+        # Берём только nm_id (не сами объекты Product), т.к. каждый товар будет
+        # обрабатываться в своей собственной сессии ниже.
         result = await session.execute(
-            select(Product)
+            select(Product.nm_id)
             .join(UserProduct)
             .where(
                 UserProduct.is_active == True,
@@ -329,28 +390,31 @@ async def run_monitoring_cycle(bot: Bot) -> None:
             )
             .distinct()
         )
-        products = list(result.scalars().all())
+        nm_ids = [row[0] for row in result.all()]
 
-        if not products:
-            logger.info("Нет активных товаров для мониторинга")
-            return
+    if not nm_ids:
+        logger.info("Нет активных товаров для мониторинга")
+        return
 
-        logger.info(f"Найдено {len(products)} товаров для обновления")
+    logger.info(f"Найдено {len(nm_ids)} товаров для обновления")
 
-        total_notifications = 0
-        success = 0
-        failed = 0
+    semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_PARSES)
+    results = await asyncio.gather(
+        *(_process_one_product_safe(nm_id, bot, semaphore) for nm_id in nm_ids),
+        return_exceptions=True,
+    )
 
-        for product in products:
-            try:
-                sent = await process_product(session, product, bot)
-                total_notifications += sent
-                success += 1
-            except Exception as e:
-                failed += 1
-                logger.error(f"Ошибка при обработке nm_id={product.nm_id}: {e}")
+    total_notifications = 0
+    success = 0
+    failed = 0
+    for r in results:
+        if isinstance(r, Exception):
+            failed += 1
+        else:
+            success += 1
+            total_notifications += r
 
-        logger.info(
-            f"✅ Цикл завершён. Успешно: {success}, ошибок: {failed}, "
-            f"уведомлений отправлено: {total_notifications}"
-        )
+    logger.info(
+        f"✅ Цикл завершён. Успешно: {success}, ошибок: {failed}, "
+        f"уведомлений отправлено: {total_notifications}"
+    )

@@ -11,6 +11,9 @@ from bot.services.db_service import (
     add_product_to_user,
     get_user_products,
     get_user_product,
+    get_user_products_page,
+    get_product_history,
+    set_user_product_notifications_enabled,
 )
 from bot.keyboards.inline import (
     main_menu_kb,
@@ -20,6 +23,8 @@ from bot.keyboards.inline import (
     products_list_kb,
     PRODUCTS_PER_PAGE,
     back_to_menu_kb,
+    product_history_kb,
+    product_notify_kb,
 )
 from bot.database.session import async_session
 from bot.config import settings
@@ -209,8 +214,12 @@ async def process_add_product(message: Message, state: FSMContext):
 async def _show_products_page(callback: CallbackQuery, page: int = 0):
     async with async_session() as session:
         user = await get_or_create_user(session, callback.from_user.id)
-        all_products = await get_user_products(session, user.id)
-        total = len(all_products)
+        # Берём из базы СРАЗУ только нужную страницу (LIMIT/OFFSET),
+        # а не все товары пользователя целиком — так бот не тормозит
+        # и не грузит сервер, даже если товаров сотни.
+        page_items, total = await get_user_products_page(
+            session, user.id, page=page, per_page=PRODUCTS_PER_PAGE
+        )
 
         if total == 0:
             await _edit(
@@ -219,10 +228,6 @@ async def _show_products_page(callback: CallbackQuery, page: int = 0):
                 main_menu_kb(),
             )
             return
-
-        start = page * PRODUCTS_PER_PAGE
-        end = start + PRODUCTS_PER_PAGE
-        page_items = all_products[start:end]
 
         text = (
             f"📋 <b>Мои товары</b> — {total} шт.\n\n"
@@ -340,23 +345,121 @@ async def cb_delete_confirm(callback: CallbackQuery):
     await _edit(callback, "🗑 Товар удалён.", main_menu_kb())
 
 
-# Заглушки для истории и уведомлений по товару (следующий этап)
-@router.callback_query(F.data.startswith("history:"))
-async def cb_history_stub(callback: CallbackQuery):
-    await callback.answer("История цен — в следующем обновлении", show_alert=True)
+# ===================== ИСТОРИЯ ЦЕН (в карточке товара) =====================
 
+def format_history_text(product, history_rows) -> str:
+    name = product.name or f"Артикул {product.nm_id}"
+    header = f"📈 <b>История цен</b>\n<b>{name}</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+
+    if not history_rows:
+        return header + "Пока нет данных — история появится после первого обновления цены."
+
+    lines = []
+    # history_rows приходит от новых к старым — печатаем так же, сверху последнее изменение
+    for row in history_rows:
+        date_str = row.recorded_at.strftime("%d.%m.%Y %H:%M")
+        if row.price is not None:
+            price_str = f"{row.price:,.0f}".replace(",", " ") + " рублей"
+        else:
+            price_str = "нет данных"
+
+        line = f"🗓 {date_str} — цена {price_str}"
+        if row.price_without_discount is not None:
+            old_str = f"{row.price_without_discount:,.0f}".replace(",", " ")
+            line += f" / без скидки {old_str} рублей"
+        lines.append(line)
+
+    text = header + "\n".join(lines)
+
+    # Телеграм режет сообщения длиннее 4096 символов — на всякий случай подрежем
+    if len(text) > 3900:
+        text = text[:3880] + "\n\n… (показаны не все записи)"
+
+    return text
+
+
+@router.callback_query(F.data.startswith("history:"))
+async def cb_history(callback: CallbackQuery):
+    product_id = int(callback.data.split(":")[1])
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        up = await get_user_product(session, user.id, product_id)
+        if not up:
+            await callback.answer("Товар не найден", show_alert=True)
+            return
+
+        history_rows = await get_product_history(session, up.product.id, limit=30)
+        text = format_history_text(up.product, history_rows)
+        await _edit(callback, text, product_history_kb(product_id))
+
+
+# ===================== УВЕДОМЛЕНИЯ ПО ТОВАРУ (в карточке товара) =====================
 
 @router.callback_query(F.data.startswith("notify_settings:"))
-async def cb_notify_stub(callback: CallbackQuery):
-    await callback.answer("Настройки уведомлений — в следующем обновлении", show_alert=True)
+async def cb_notify_settings(callback: CallbackQuery):
+    product_id = int(callback.data.split(":")[1])
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        up = await get_user_product(session, user.id, product_id)
+        if not up:
+            await callback.answer("Товар не найден", show_alert=True)
+            return
+
+        name = up.product.name or f"Артикул {up.product.nm_id}"
+        status = "включены 🔔" if up.notifications_enabled else "выключены 🔕"
+        text = (
+            f"🔔 <b>Уведомления по товару</b>\n\n"
+            f"<b>{name}</b>\n\n"
+            f"Сейчас уведомления по этому товару <b>{status}</b>.\n\n"
+            "Если выключить — бот продолжит следить за товаром, "
+            "но сообщения об изменениях по нему присылать не будет."
+        )
+        await _edit(callback, text, product_notify_kb(product_id, enabled=up.notifications_enabled))
+
+
+@router.callback_query(F.data.startswith("product_notify:"))
+async def cb_product_notify_toggle(callback: CallbackQuery):
+    _, product_id_str, mode = callback.data.split(":")
+    product_id = int(product_id_str)
+    enabled = mode == "on"
+
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        up = await set_user_product_notifications_enabled(
+            session, user.id, product_id, enabled
+        )
+        if not up:
+            await callback.answer("Товар не найден", show_alert=True)
+            return
+
+        name = up.product.name or f"Артикул {up.product.nm_id}"
+        status = "включены 🔔" if enabled else "выключены 🔕"
+        text = (
+            f"🔔 <b>Уведомления по товару</b>\n\n"
+            f"<b>{name}</b>\n\n"
+            f"Уведомления по этому товару теперь <b>{status}</b>."
+        )
+        await _edit(callback, text, product_notify_kb(product_id, enabled=enabled))
 
 
 @router.callback_query(F.data.startswith("notify_global:"))
 async def cb_notify_global(callback: CallbackQuery):
-    mode = callback.data.split(":")[1]
-    if mode == "off":
-        text = "🔕 Уведомления по всем товарам <b>выключены</b> (заглушка, логика в следующем этапе)."
-    else:
-        text = "🔔 Уведомления по всем товарам <b>включены</b> (заглушка, логика в следующем этапе)."
     from bot.keyboards.inline import notifications_global_kb
-    await _edit(callback, text, notifications_global_kb(enabled=(mode == "on")))
+    from bot.services.db_service import set_user_notifications_enabled
+
+    mode = callback.data.split(":")[1]
+    enabled = mode == "on"
+
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        await set_user_notifications_enabled(session, user, enabled)
+
+    if enabled:
+        text = "🔔 Уведомления по всем товарам <b>включены</b>."
+    else:
+        text = (
+            "🔕 Уведомления по всем товарам <b>выключены</b>.\n\n"
+            "Мониторинг цен продолжит работать, но сообщения об изменениях "
+            "присылаться не будут."
+        )
+    await _edit(callback, text, notifications_global_kb(enabled=enabled))

@@ -24,6 +24,8 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     max_products: Mapped[int] = mapped_column(Integer, default=50)
+    # Глобальный переключатель уведомлений по ВСЕМ товарам пользователя
+    notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -131,6 +133,9 @@ class UserProduct(Base):
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)  # мониторинг включён
     is_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Быстрый вкл/выкл уведомлений по конкретному товару (кнопка "🔔 Уведомления" в карточке)
+    notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
     # Настройки уведомлений
     notify_price_drop: Mapped[bool] = mapped_column(Boolean, default=True)

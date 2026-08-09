@@ -6,7 +6,8 @@ import re
 import random
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+from decimal import Decimal, InvalidOperation
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
 import requests
@@ -87,8 +88,57 @@ def _get_product_sync(nm_id: int) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _kopecks_to_rub(value: Any) -> Optional[float]:
+    """
+    Нормализует цену, полученную от WB (число в копейках), в рубли.
+
+    Почему через Decimal, а не просто value / 100:
+    обычное деление float может давать погрешности представления
+    (например 0.1 + 0.2 != 0.3 в float), а для денег это недопустимо —
+    из-за этого сравнение старой и новой цены могло изредка "видеть"
+    несуществующее изменение на доли копейки. Decimal + quantize даёт
+    точное и предсказуемое значение с 2 знаками после запятой.
+
+    Возвращает None (а не 0 и не какое-то произвольное число), если:
+      - значения нет вовсе;
+      - значение не является числом;
+      - значение <= 0 (цена не может быть нулевой или отрицательной —
+        это признак некорректного/неполного ответа WB, а не реальная цена).
+    """
+    if value is None:
+        return None
+    try:
+        kopecks = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        logger.warning(f"[Parser] Цена не является числом: {value!r}")
+        return None
+    if kopecks <= 0:
+        logger.warning(f"[Parser] Некорректная цена (<= 0): {value!r}")
+        return None
+    rub = (kopecks / Decimal(100)).quantize(Decimal("0.01"))
+    return float(rub)
+
+
+def _select_price_data(sizes: List[dict]) -> dict:
+    """
+    Выбирает объект price из первого варианта (size), где он реально
+    присутствует.
+
+    Раньше цена бралась только из sizes[0], а WB иногда отдаёт для
+    первого варианта (например, для размера/цвета, которого сейчас нет
+    в наличии) пустой объект price: {} — при этом у ДРУГИХ вариантов
+    того же товара цена в ответе есть. Из-за этого current_price
+    становился None, хотя реальная цена товара была известна.
+    """
+    for size in sizes:
+        price_data = size.get("price") or {}
+        if price_data.get("product") is not None or price_data.get("basic") is not None:
+            return price_data
+    return {}
+
+
 def _parse_product(product: dict, nm_id: int) -> Dict[str, Any]:
-    """Разбор товара — цена из sizes[0].price (актуальный формат)"""
+    """Разбор товара — цена из sizes[].price (актуальный формат)"""
 
     name = product.get("name")
     brand = product.get("brand")
@@ -99,32 +149,32 @@ def _parse_product(product: dict, nm_id: int) -> Dict[str, Any]:
     questions = product.get("questionsCount") or 0
     subject = product.get("subjectName") or product.get("entity")
 
-    current_price = None
-    basic_price = None
     discount = None
     stock = 0
 
     sizes = product.get("sizes") or []
-    if sizes:
-        price_data = sizes[0].get("price") or {}
+    price_data = _select_price_data(sizes)
 
-        if price_data.get("product") is not None:
-            current_price = price_data["product"] / 100
-        if price_data.get("basic") is not None:
-            basic_price = price_data["basic"] / 100
+    current_price = _kopecks_to_rub(price_data.get("product"))
+    basic_price = _kopecks_to_rub(price_data.get("basic"))
 
-        # запасной старый формат
-        if current_price is None and product.get("salePriceU") is not None:
-            current_price = product["salePriceU"] / 100
-        if basic_price is None and product.get("priceU") is not None:
-            basic_price = product["priceU"] / 100
+    # Запасной старый формат ("salePriceU"/"priceU" на верхнем уровне товара).
+    # ВАЖНО: этот фолбэк раньше был случайно вложен внутрь `if sizes:`, из-за
+    # чего не срабатывал вообще, если WB возвращал товар без массива sizes —
+    # цена в этом случае терялась (current_price оставался None), хотя старый
+    # формат цены в ответе присутствовал. Теперь фолбэк применяется всегда,
+    # когда основной (новый) формат не дал результата — независимо от sizes.
+    if current_price is None:
+        current_price = _kopecks_to_rub(product.get("salePriceU"))
+    if basic_price is None:
+        basic_price = _kopecks_to_rub(product.get("priceU"))
 
-        if current_price is not None and basic_price and basic_price > 0:
-            discount = round((1 - current_price / basic_price) * 100, 1)
+    if current_price is not None and basic_price and basic_price > 0:
+        discount = round((1 - current_price / basic_price) * 100, 1)
 
-        for size in sizes:
-            for st in size.get("stocks") or []:
-                stock += st.get("qty", 0)
+    for size in sizes:
+        for st in size.get("stocks") or []:
+            stock += st.get("qty", 0)
 
     if stock == 0 and product.get("totalQuantity") is not None:
         stock = int(product["totalQuantity"])
@@ -143,8 +193,10 @@ def _parse_product(product: dict, nm_id: int) -> Dict[str, Any]:
         "seller": supplier,
         "seller_rating": float(supplier_rating) if supplier_rating is not None else None,
         "url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
-        "current_price": round(current_price, 2) if current_price is not None else None,
-        "price_without_discount": round(basic_price, 2) if basic_price is not None else None,
+        # current_price/basic_price уже нормализованы в _kopecks_to_rub — дополнительное
+        # округление не нужно (и могло бы снова внести погрешность float).
+        "current_price": current_price,
+        "price_without_discount": basic_price,
         "discount_percent": discount,
         "stock": stock if stock > 0 else None,
         "rating": float(rating) if rating is not None else None,

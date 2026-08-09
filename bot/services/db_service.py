@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, List
 from datetime import datetime, timezone
 
@@ -7,6 +8,8 @@ from sqlalchemy.orm import selectinload
 
 from bot.database.models import User, Product, ProductHistory, UserProduct, Group
 from bot.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 async def get_or_create_user(
@@ -63,6 +66,11 @@ async def get_or_create_product(session: AsyncSession, data: dict) -> Product:
     product = result.scalar_one_or_none()
 
     if product is None:
+        if data.get("current_price") is None:
+            logger.warning(
+                f"[DB] nm_id={data.get('nm_id')}: создаю новый товар без цены "
+                f"(парсер не смог получить цену при первом добавлении)"
+            )
         product = Product(
             nm_id=data["nm_id"],
             name=data.get("name"),
@@ -84,15 +92,36 @@ async def get_or_create_product(session: AsyncSession, data: dict) -> Product:
         session.add(product)
         await session.flush()  # чтобы получить id
     else:
-        # Обновляем текущие данные
+        # Обновляем текущие данные.
+        #
+        # ВАЖНО про цену: раньше поле current_price перезаписывалось значением
+        # data.get("current_price") безусловно. Если парсер получал ошибку/пустую
+        # цену (например, страница WB временно отдала товар без цены), data["current_price"]
+        # оказывался None — и он молча затирал последнюю КОРРЕКТНУЮ сохранённую цену
+        # (1499 → None). После этого следующее реальное изменение цены сравнивалось
+        # бы уже не со старой ценой, а с "дырой", и уведомление могло не отправиться
+        # или отправиться с некорректным "было".
+        #
+        # Теперь: если новых данных о цене нет — старое значение в БД не трогаем.
+        if data.get("current_price") is not None:
+            product.current_price = data["current_price"]
+        else:
+            logger.warning(
+                f"[DB] nm_id={product.nm_id}: новая цена не получена "
+                f"(парсер вернул None), сохраняю предыдущее значение "
+                f"current_price={product.current_price}"
+            )
+
+        if data.get("price_without_discount") is not None:
+            product.price_without_discount = data["price_without_discount"]
+        if data.get("discount_percent") is not None:
+            product.discount_percent = data["discount_percent"]
+
         product.name = data.get("name") or product.name
         product.brand = data.get("brand") or product.brand
         product.category = data.get("category") or product.category
         product.seller = data.get("seller") or product.seller
         product.url = data.get("url") or product.url
-        product.current_price = data.get("current_price")
-        product.price_without_discount = data.get("price_without_discount")
-        product.discount_percent = data.get("discount_percent")
         product.stock = data.get("stock")
         product.rating = data.get("rating")
         product.feedbacks_count = data.get("feedbacks_count")
@@ -101,12 +130,15 @@ async def get_or_create_product(session: AsyncSession, data: dict) -> Product:
         product.is_available = data.get("is_available", True)
         product.last_updated = data.get("last_updated") or datetime.now(timezone.utc)
 
-    # Всегда пишем историю
+    # Всегда пишем историю — но ЦЕНОВЫЕ поля берём из уже смёрженного product,
+    # а не из сырого data. Иначе при неудачном парсинге цены (data["current_price"] is None)
+    # в историю попадала бы запись price=None, хотя реальная (сохранённая) цена товара
+    # не менялась — это искажало бы график/историю цен.
     history = ProductHistory(
         product_id=product.id,
-        price=data.get("current_price"),
-        price_without_discount=data.get("price_without_discount"),
-        discount_percent=data.get("discount_percent"),
+        price=product.current_price,
+        price_without_discount=product.price_without_discount,
+        discount_percent=product.discount_percent,
         stock=data.get("stock"),
         rating=data.get("rating"),
         feedbacks_count=data.get("feedbacks_count"),
@@ -190,6 +222,189 @@ async def get_user_product(
     result = await session.execute(
         select(UserProduct)
         .where(UserProduct.user_id == user_id, UserProduct.product_id == product_id)
-        .options(selectinload(UserProduct.product))
+        # group тоже подгружаем заранее (eager load) — иначе обращение к
+        # user_product.group вне активной сессии/в async-контексте без await
+        # упадёт с MissingGreenlet (ленивая подгрузка синхронно не работает
+        # в asyncio-сессии SQLAlchemy).
+        .options(selectinload(UserProduct.product), selectinload(UserProduct.group))
     )
     return result.scalar_one_or_none()
+
+
+async def get_user_products_page(
+    session: AsyncSession,
+    user_id: int,
+    page: int = 0,
+    per_page: int = 6,
+) -> tuple[List[UserProduct], int]:
+    """
+    Постраничная выборка товаров пользователя ПРЯМО НА УРОВНЕ БАЗЫ (LIMIT/OFFSET),
+    чтобы не тянуть из базы разом все товары пользователя — так бот не тормозит
+    и не грузит сервер, даже если у пользователя сотни товаров.
+    Возвращает (товары_на_странице, всего_товаров).
+    """
+    count_result = await session.execute(
+        select(func.count(UserProduct.id)).where(UserProduct.user_id == user_id)
+    )
+    total = count_result.scalar() or 0
+
+    result = await session.execute(
+        select(UserProduct)
+        .where(UserProduct.user_id == user_id)
+        .options(
+            selectinload(UserProduct.product),
+            selectinload(UserProduct.group),
+        )
+        .order_by(UserProduct.created_at.desc())
+        .limit(per_page)
+        .offset(page * per_page)
+    )
+    items = list(result.scalars().all())
+    return items, total
+
+
+async def get_all_user_product_ids(session: AsyncSession, user_id: int) -> List[int]:
+    """Только id товаров пользователя (для экрана выбора товаров в Excel-отчёте)."""
+    result = await session.execute(
+        select(UserProduct.product_id).where(UserProduct.user_id == user_id)
+    )
+    return [row[0] for row in result.all()]
+
+
+async def get_product_history(
+    session: AsyncSession,
+    product_id: int,
+    limit: int = 30,
+) -> List[ProductHistory]:
+    """Последние записи истории цен/показателей товара, от новых к старым."""
+    result = await session.execute(
+        select(ProductHistory)
+        .where(ProductHistory.product_id == product_id)
+        .order_by(ProductHistory.recorded_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def get_product_by_nm_id(session: AsyncSession, nm_id: int) -> Optional[Product]:
+    """Найти товар по артикулу WB (для тестовой команды /simulate_price)."""
+    result = await session.execute(select(Product).where(Product.nm_id == nm_id))
+    return result.scalar_one_or_none()
+
+
+async def get_user_products_by_ids(
+    session: AsyncSession, user_id: int, product_ids: List[int]
+) -> List[Product]:
+    """Товары пользователя (Product), отфильтрованные по списку id — для Excel-отчёта."""
+    if not product_ids:
+        return []
+    result = await session.execute(
+        select(Product)
+        .join(UserProduct, UserProduct.product_id == Product.id)
+        .where(UserProduct.user_id == user_id, Product.id.in_(product_ids))
+        .order_by(UserProduct.created_at.desc())
+    )
+    return list(result.scalars().unique().all())
+
+
+async def set_user_notifications_enabled(
+    session: AsyncSession, user: User, enabled: bool
+) -> None:
+    """Глобальный вкл/выкл уведомлений по ВСЕМ товарам пользователя (кнопка в главном меню)."""
+    user.notifications_enabled = enabled
+    await session.commit()
+
+
+async def set_user_product_notifications_enabled(
+    session: AsyncSession, user_id: int, product_id: int, enabled: bool
+) -> Optional[UserProduct]:
+    """Вкл/выкл уведомлений по ОДНОМУ товару (кнопка «🔔 Уведомления» в карточке товара)."""
+    result = await session.execute(
+        select(UserProduct)
+        .where(UserProduct.user_id == user_id, UserProduct.product_id == product_id)
+        .options(selectinload(UserProduct.product))
+    )
+    up = result.scalar_one_or_none()
+    if up:
+        up.notifications_enabled = enabled
+        await session.commit()
+        await session.refresh(up, attribute_names=["notifications_enabled"])
+    return up
+
+
+async def set_user_product_paused(
+    session: AsyncSession, user_id: int, product_id: int, paused: bool
+) -> Optional[UserProduct]:
+    """Ставит/снимает товар с паузы мониторинга (используется мини-приложением)."""
+    result = await session.execute(
+        select(UserProduct)
+        .where(UserProduct.user_id == user_id, UserProduct.product_id == product_id)
+        .options(selectinload(UserProduct.product))
+    )
+    up = result.scalar_one_or_none()
+    if up:
+        up.is_paused = paused
+        await session.commit()
+        await session.refresh(up, attribute_names=["is_paused"])
+    return up
+
+
+# Поля UserProduct, которые разрешено менять через API мини-приложения.
+# Белый список — чтобы через API нельзя было случайно/умышленно перезаписать
+# служебные поля (id, user_id, product_id, created_at и т.п.).
+_ALLOWED_USER_PRODUCT_SETTINGS = {
+    "notifications_enabled",
+    "is_paused",
+    "notify_price_drop",
+    "notify_price_rise",
+    "price_threshold_percent",
+    "price_threshold_rub",
+    "price_below",
+    "price_above",
+    "notify_stock_below",
+    "notify_availability",
+    "notify_rating_change",
+    "notify_feedbacks_change",
+    "notify_promo",
+    "email_notifications",
+}
+
+
+async def update_user_product_settings(
+    session: AsyncSession, user_id: int, product_id: int, fields: dict
+) -> Optional[UserProduct]:
+    """Точечно обновляет настройки уведомлений товара (мини-приложение)."""
+    result = await session.execute(
+        select(UserProduct)
+        .where(UserProduct.user_id == user_id, UserProduct.product_id == product_id)
+        .options(selectinload(UserProduct.product))
+    )
+    up = result.scalar_one_or_none()
+    if not up:
+        return None
+
+    changed = []
+    for key, value in fields.items():
+        if key in _ALLOWED_USER_PRODUCT_SETTINGS and hasattr(up, key):
+            setattr(up, key, value)
+            changed.append(key)
+
+    if changed:
+        await session.commit()
+        await session.refresh(up)
+    return up
+
+
+async def remove_user_product(session: AsyncSession, user_id: int, product_id: int) -> bool:
+    """Полностью убирает товар из списка пользователя (мониторинг товара для остальных не трогает)."""
+    result = await session.execute(
+        select(UserProduct).where(
+            UserProduct.user_id == user_id, UserProduct.product_id == product_id
+        )
+    )
+    up = result.scalar_one_or_none()
+    if not up:
+        return False
+    await session.delete(up)
+    await session.commit()
+    return True

@@ -1,11 +1,60 @@
+# ===== Секреты и конфигурация =====
 .env
+.env.*
+!.env.example
+
+# ===== База данных =====
+*.db
+*.sqlite
+*.sqlite3
 wb_monitor.db
 
-*.db
+# ===== Python =====
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-*.pyc
-.venv/
+# ===== Виртуальные окружения =====
 venv/
-.idea/
+.venv/
+env/
+ENV/
+
+# ===== Логи =====
+*.log
+logs/
+
+# ===== Экспортированные отчёты (могут содержать реальные данные пользователей) =====
+*.xlsx
+*.xls
+!templates/*.xlsx
+
+# ===== IDE / ОС =====
 .vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== Alembic (миграции — оставляем скрипты, но не runtime-мусор) =====
+alembic.ini.local
+
+# ===== Прочее =====
+*.bak
+*.tmp

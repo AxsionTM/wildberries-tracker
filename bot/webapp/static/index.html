@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>WB Monitor</title>
+<link rel="stylesheet" href="style.css" />
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+
+<div id="toast" class="toast" aria-live="polite"></div>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 12.5 9 18l11-13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </span>
+    <div class="topbar__titles">
+      <h1>WB Monitor</h1>
+      <p id="userSubtitle" class="topbar__subtitle">—</p>
+    </div>
+  </div>
+  <button id="notifBell" class="bell-btn" title="Уведомления по всем товарам" aria-label="Переключить уведомления">
+    <svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 3a5 5 0 0 0-5 5v3.4c0 .7-.25 1.37-.7 1.9L5 15.2a1 1 0 0 0 .76 1.65h12.48A1 1 0 0 0 19 15.2l-1.3-1.9a3.1 3.1 0 0 1-.7-1.9V8a5 5 0 0 0-5-5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9.5 19a2.5 2.5 0 0 0 5 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+  </button>
+</header>
+
+<main id="view" class="view"></main>
+
+<template id="tpl-empty">
+  <div class="empty-state">
+    <div class="empty-state__icon">🛍️</div>
+    <p class="empty-state__title"></p>
+    <p class="empty-state__hint"></p>
+  </div>
+</template>
+
+<template id="tpl-product-card">
+  <button class="pcard" type="button">
+    <div class="pcard__top">
+      <span class="pcard__badge"></span>
+      <span class="pcard__trend"></span>
+    </div>
+    <p class="pcard__name"></p>
+    <div class="pcard__row">
+      <div class="pcard__price">
+        <span class="pcard__price-now"></span>
+        <span class="pcard__price-old"></span>
+      </div>
+      <span class="pcard__discount"></span>
+    </div>
+    <div class="pcard__meta">
+      <span class="pcard__rating"></span>
+      <span class="pcard__stock"></span>
+      <span class="pcard__paused">⏸ пауза</span>
+    </div>
+  </button>
+</template>
+
+<nav class="tabbar">
+  <button class="tab" data-tab="products" aria-label="Товары">
+    <svg viewBox="0 0 24 24" width="22" height="22"><rect x="3.5" y="3.5" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+    <span>Товары</span>
+  </button>
+  <button class="tab" data-tab="add" aria-label="Добавить">
+    <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 8.3v7.4M8.3 12h7.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+    <span>Добавить</span>
+  </button>
+  <button class="tab" data-tab="export" aria-label="Отчёт">
+    <svg viewBox="0 0 24 24" width="22" height="22"><path d="M6 3.5h8l4 4V20a.7.7 0 0 1-.7.7H6a.7.7 0 0 1-.7-.7V4.2a.7.7 0 0 1 .7-.7Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9 13.2l2.2 2.2 4-4.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>Отчёт</span>
+  </button>
+</nav>
+
+<script src="app.js"></script>
+</body>
+</html>
